@@ -1,0 +1,9 @@
+livekit-agents[silero,groq,cartesia,deepgram]~=1.0
+livekit-api
+fastapi
+uvicorn[standard]
+httpx
+pydantic
+python-dotenv
+pytest
+pytest-asyncio
