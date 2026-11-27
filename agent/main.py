@@ -219,15 +219,39 @@ class ClinicReceptionistAgent(Agent):
 
 
 def _create_tts():
-    provider = os.getenv("TTS_PROVIDER", "cartesia").strip().lower()
+    provider = os.getenv("TTS_PROVIDER", "auto").strip().lower()
+
+    cartesia_key = os.getenv("CARTESIA_API_KEY", "").strip()
+    deepgram_key = os.getenv("DEEPGRAM_API_KEY", "").strip()
+
+    # Auto-detect: prefer Cartesia if key set, then Deepgram, then error with clear message
+    if provider == "auto":
+        if cartesia_key:
+            provider = "cartesia"
+        elif deepgram_key:
+            provider = "deepgram"
+        else:
+            raise RuntimeError(
+                "No TTS API key found. Set CARTESIA_API_KEY or DEEPGRAM_API_KEY in .env. "
+                "Get a free Deepgram key at https://console.deepgram.com"
+            )
+
     if provider == "deepgram":
+        if not deepgram_key:
+            raise RuntimeError("TTS_PROVIDER=deepgram but DEEPGRAM_API_KEY is not set in .env")
         return deepgram.TTS(
             model=os.getenv("DEEPGRAM_TTS_MODEL", "aura-2-thalia-en"),
         )
-    return cartesia.TTS(
-        model=os.getenv("CARTESIA_MODEL", "sonic-2"),
-        voice=os.getenv("CARTESIA_VOICE", "a0e99841-438c-4a64-b679-ae501e7d6091"),
-    )
+
+    if provider == "cartesia":
+        if not cartesia_key:
+            raise RuntimeError("TTS_PROVIDER=cartesia but CARTESIA_API_KEY is not set in .env")
+        return cartesia.TTS(
+            model=os.getenv("CARTESIA_MODEL", "sonic-2"),
+            voice=os.getenv("CARTESIA_VOICE", "a0e99841-438c-4a64-b679-ae501e7d6091"),
+        )
+
+    raise RuntimeError(f"Unknown TTS_PROVIDER={provider!r}. Use 'cartesia' or 'deepgram'.")
 
 
 async def entrypoint(ctx: JobContext) -> None:
