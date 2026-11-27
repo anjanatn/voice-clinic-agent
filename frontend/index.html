@@ -14,8 +14,8 @@
       <div class="brand">
         <div class="brand-mark">PC</div>
         <div>
-          <h1>PulseCare Voice Desk</h1>
-          <p class="subtitle">LiveKit Agents · Groq Whisper + Llama · <span id="tts-provider-label">Cartesia</span> TTS · FastAPI Tools</p>
+          <h1>PulseCare Real-Time Voice Desk</h1>
+          <p class="subtitle">LiveKit + Groq (Whisper &amp; Llama) + <span id="tts-provider-label">Cartesia</span> · Keyless Browser Voice Fallback (Web Speech API)</p>
         </div>
       </div>
 
@@ -24,6 +24,7 @@
         <span class="pill pill-muted" id="pill-groq">Groq: checking...</span>
         <span class="pill pill-muted" id="pill-tts">TTS: checking...</span>
         <span class="pill pill-muted" id="pill-livekit">LiveKit: checking...</span>
+        <span class="pill pill-muted" id="pill-webspeech">Browser Voice: checking...</span>
       </div>
     </header>
 
@@ -40,11 +41,15 @@
       </div>
 
       <div class="action-buttons">
-        <button id="btn-connect" class="btn btn-primary">
-          <span class="dot"></span> Connect Live Voice
+        <button id="btn-browser-voice" class="btn btn-accent">
+          <span class="dot"></span> Talk Now (Keyless Browser Voice)
         </button>
+        <button id="btn-connect" class="btn btn-primary">
+          <span class="dot"></span> Connect LiveKit Voice
+        </button>
+        <button id="btn-barge-in" class="btn btn-secondary" disabled>Interrupt (Barge-In)</button>
         <button id="btn-mute" class="btn btn-secondary" disabled>Mute Mic</button>
-        <button id="btn-demo" class="btn btn-accent">Simulate Live Call (Real FastAPI Tools)</button>
+        <button id="btn-demo" class="btn btn-ghost">Keyless Fallback: Replay Simulation</button>
         <button id="btn-reset" class="btn btn-ghost">Reset Schedule</button>
       </div>
     </section>
@@ -53,7 +58,7 @@
       <div class="metric-card hero-metric">
         <span class="metric-label">Last Response Time (Voice-to-Voice)</span>
         <div class="metric-value" id="metric-last-total">-- <small>ms</small></div>
-        <span class="metric-sub" id="metric-mode-badge">Waiting for turn</span>
+        <span class="metric-sub" id="metric-mode-badge">Waiting for voice turn</span>
       </div>
       <div class="metric-card">
         <span class="metric-label">Avg Response Time</span>
@@ -61,7 +66,7 @@
         <span class="metric-sub" id="metric-turn-count">0 turns measured</span>
       </div>
       <div class="metric-card">
-        <span class="metric-label">Groq LLM TTFT</span>
+        <span class="metric-label">LLM / Engine Time</span>
         <div class="metric-value" id="metric-llm-ttft">-- <small>ms</small></div>
         <span class="metric-sub" id="metric-tps">-- tok/s</span>
       </div>
@@ -71,7 +76,7 @@
         <span class="metric-sub" id="metric-eou">EOU: -- ms</span>
       </div>
       <div class="metric-card state-card">
-        <span class="metric-label">Agent State</span>
+        <span class="metric-label">Agent State &amp; Mic VAD</span>
         <div class="state-row">
           <span class="state-badge state-idle" id="agent-state-badge">IDLE</span>
           <div class="waveform" id="waveform" aria-hidden="true">
@@ -86,26 +91,35 @@
       <section class="panel conversation-panel">
         <div class="panel-header">
           <div>
-            <h2>Live Conversation &amp; Tool Trace</h2>
-            <p class="panel-desc">Every assistant turn displays end-to-end latency and FastAPI tool execution time.</p>
+            <h2>Live Voice Conversation &amp; Verification Trace</h2>
+            <p class="panel-desc">Supports barge-in, silence check-ins, repeat requests, and read-back verification before booking.</p>
           </div>
           <button id="btn-clear-chat" class="btn btn-ghost btn-sm">Clear Log</button>
         </div>
 
         <div class="chat-feed" id="chat-feed">
           <div class="empty-state">
-            Click <strong>Connect Live Voice</strong> (with LiveKit + Groq + TTS keys in <code>.env</code>) to speak in real time, or click <strong>Simulate Live Call</strong> to run a live multi-turn booking walkthrough against the FastAPI + SQLite backend.
+            Click <strong>Talk Now (Keyless Browser Voice)</strong> to speak directly via Web Speech API with zero API keys, or click <strong>Connect LiveKit Voice</strong> when <code>.env</code> keys are configured.
           </div>
         </div>
+
+        <form class="voice-text-bar" id="voice-text-form">
+          <input
+            type="text"
+            id="voice-text-input"
+            placeholder="Speak with the mic button above, or type a phrase here (e.g. 'Book dentistry tomorrow' or 'Sorry, can you repeat that')"
+          />
+          <button type="submit" class="btn btn-secondary btn-sm">Send Turn</button>
+        </form>
 
         <div class="waterfall-section">
           <div class="waterfall-header">
             <h3>Per-Turn Latency Breakdown</h3>
             <div class="legend">
               <span><i class="swatch sw-eou"></i>EOU/VAD</span>
-              <span><i class="swatch sw-llm"></i>Groq LLM TTFT</span>
+              <span><i class="swatch sw-llm"></i>LLM / NLU</span>
               <span><i class="swatch sw-tool"></i>FastAPI Tool</span>
-              <span><i class="swatch sw-tts"></i>TTS TTFB</span>
+              <span><i class="swatch sw-tts"></i>TTS Start</span>
             </div>
           </div>
           <div class="waterfall-list" id="waterfall-list">

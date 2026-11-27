@@ -187,9 +187,37 @@ select {
 }
 
 .btn-accent {
-  background: rgba(16, 185, 129, 0.15);
-  border-color: rgba(16, 185, 129, 0.5);
+  background: rgba(16, 185, 129, 0.16);
+  border-color: rgba(16, 185, 129, 0.55);
   color: #6ee7b7;
+}
+
+.btn-accent.active-voice {
+  background: var(--danger);
+  border-color: #f87171;
+  color: #fff;
+  box-shadow: 0 0 18px rgba(239, 68, 68, 0.25);
+}
+
+.voice-text-bar {
+  display: flex;
+  gap: 8px;
+}
+
+.voice-text-bar input {
+  flex: 1;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 11px;
+  font-size: 0.84rem;
+}
+
+.latency-pill.confirm {
+  background: rgba(245, 158, 11, 0.16);
+  border-color: rgba(245, 158, 11, 0.5);
+  color: #fcd34d;
 }
 
 .btn-secondary {

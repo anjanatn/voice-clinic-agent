@@ -62,3 +62,20 @@ class LiveKitTokenResponse(BaseModel):
     tts_provider: str
     stt_model: str
     llm_model: str
+
+
+class VoiceTurnRequest(BaseModel):
+    session_id: str = Field(default="browser-default")
+    transcript: str = Field(default="")
+    event: str = Field(default="speech", description="'speech' or 'silence'")
+    patient_name: str = Field(default="")
+
+
+class VoiceTurnResponse(BaseModel):
+    reply: str
+    tool_events: list[dict]
+    tool_total_ms: float
+    server_ms: float
+    awaiting_confirmation: bool
+    schedule_changed: bool
+

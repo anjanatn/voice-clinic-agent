@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import db
+from . import db, voice_engine
 from .models import (
     Appointment,
     BookAppointmentRequest,
@@ -22,6 +22,8 @@ from .models import (
     LiveKitTokenResponse,
     RescheduleAppointmentRequest,
     TimeSlot,
+    VoiceTurnRequest,
+    VoiceTurnResponse,
 )
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -204,8 +206,22 @@ async def delete_appointment(booking_id: str) -> Appointment:
 @app.post("/api/reset")
 async def reset_demo_data() -> dict:
     db.init_db(force_reset=True)
+    voice_engine.reset_sessions()
     await _broadcast_event("schedule_updated", {"action": "reset"})
     return {"status": "reset", "appointments": len(db.list_appointments())}
+
+
+@app.post("/api/voice/turn", response_model=VoiceTurnResponse)
+async def handle_voice_turn(payload: VoiceTurnRequest) -> VoiceTurnResponse:
+    result = voice_engine.process_voice_turn(
+        session_id=payload.session_id,
+        transcript=payload.transcript,
+        event=payload.event,
+        patient_name=payload.patient_name,
+    )
+    if result["schedule_changed"]:
+        await _broadcast_event("schedule_updated", {"action": "voice_turn"})
+    return VoiceTurnResponse(**result)
 
 
 @app.get("/api/events")

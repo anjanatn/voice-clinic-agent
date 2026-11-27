@@ -1,19 +1,25 @@
 (() => {
   const TELEMETRY_TOPIC = "pulsecare.telemetry";
+  const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
 
   const el = {
     pillApi: document.getElementById("pill-api"),
     pillGroq: document.getElementById("pill-groq"),
     pillTts: document.getElementById("pill-tts"),
     pillLivekit: document.getElementById("pill-livekit"),
+    pillWebSpeech: document.getElementById("pill-webspeech"),
     ttsProviderLabel: document.getElementById("tts-provider-label"),
     roomName: document.getElementById("room-name"),
     patientName: document.getElementById("patient-name"),
+    btnBrowserVoice: document.getElementById("btn-browser-voice"),
     btnConnect: document.getElementById("btn-connect"),
+    btnBargeIn: document.getElementById("btn-barge-in"),
     btnMute: document.getElementById("btn-mute"),
     btnDemo: document.getElementById("btn-demo"),
     btnReset: document.getElementById("btn-reset"),
     btnClearChat: document.getElementById("btn-clear-chat"),
+    voiceTextForm: document.getElementById("voice-text-form"),
+    voiceTextInput: document.getElementById("voice-text-input"),
     metricLastTotal: document.getElementById("metric-last-total"),
     metricModeBadge: document.getElementById("metric-mode-badge"),
     metricAvgTotal: document.getElementById("metric-avg-total"),
@@ -42,9 +48,31 @@
   const turnHistory = [];
   let latestBookingId = null;
 
+  // Keyless Browser Voice state (Web Speech API)
+  const browserSessionId = `browser-${Math.random().toString(36).slice(2, 10)}`;
+  let browserVoiceActive = false;
+  let recognition = null;
+  let micStream = null;
+  let audioCtx = null;
+  let vadRafId = null;
+  let silenceTimer = null;
+  let browserMute = false;
+
   function setPill(node, label, ok) {
     node.textContent = label;
     node.className = `pill ${ok ? "pill-ok" : "pill-warn"}`;
+  }
+
+  function initWebSpeechPill() {
+    const hasRec = Boolean(SpeechRecognitionCtor);
+    const hasTts = "speechSynthesis" in window;
+    if (hasRec && hasTts) {
+      setPill(el.pillWebSpeech, "Browser Voice: ready (keyless)", true);
+    } else if (hasTts) {
+      setPill(el.pillWebSpeech, "Browser Voice: TTS + text (no STT)", false);
+    } else {
+      setPill(el.pillWebSpeech, "Browser Voice: unsupported", false);
+    }
   }
 
   async function refreshHealth() {
@@ -134,9 +162,10 @@
     } else {
       el.waveform.classList.remove("active");
     }
+    el.btnBargeIn.disabled = !(browserVoiceActive && normalized === "speaking");
   }
 
-  function appendTranscript(role, text, isFinal = true, latencyBadge = null) {
+  function appendTranscript(role, text, isFinal = true, customMeta = "") {
     if (!text) return;
     clearEmptyState();
 
@@ -144,7 +173,7 @@
       if (!interimUserMsg) {
         interimUserMsg = document.createElement("div");
         interimUserMsg.className = "msg msg-user msg-interim";
-        interimUserMsg.innerHTML = `<div class="msg-meta">You (listening...)</div><div class="msg-bubble"></div>`;
+        interimUserMsg.innerHTML = `<div class="msg-meta">Caller (listening...)</div><div class="msg-bubble"></div>`;
         el.chatFeed.appendChild(interimUserMsg);
       }
       interimUserMsg.querySelector(".msg-bubble").textContent = text;
@@ -159,12 +188,11 @@
 
     const msgEl = document.createElement("div");
     msgEl.className = `msg msg-${role}`;
-    const label = role === "user" ? "Patient (Voice)" : "Maya (PulseCare AI)";
-    const badgeHtml = latencyBadge ? latencyBadge : "";
+    const label = role === "user" ? "Caller (Voice)" : "Maya (PulseCare AI)";
     msgEl.innerHTML = `
       <div class="msg-meta">
         <span>${label}</span>
-        <span class="msg-badge-slot">${badgeHtml}</span>
+        <span class="msg-badge-slot">${customMeta}</span>
       </div>
       <div class="msg-bubble">${escapeHtml(text)}</div>
     `;
@@ -172,6 +200,15 @@
     if (role === "assistant") {
       lastAssistantMsgEl = msgEl;
     }
+    el.chatFeed.scrollTop = el.chatFeed.scrollHeight;
+  }
+
+  function appendSystemNote(text) {
+    clearEmptyState();
+    const note = document.createElement("div");
+    note.className = "msg-meta";
+    note.textContent = text;
+    el.chatFeed.appendChild(note);
     el.chatFeed.scrollTop = el.chatFeed.scrollHeight;
   }
 
@@ -197,7 +234,7 @@
     }
   }
 
-  function recordLatencyTurn(turn, modeLabel = "Live WebRTC") {
+  function recordLatencyTurn(turn, modeLabel = "Live WebRTC", awaitingConfirm = false) {
     const totalMs =
       turn.perceived_total_ms !== null && turn.perceived_total_ms !== undefined
         ? turn.perceived_total_ms
@@ -216,7 +253,7 @@
       el.metricLlmTtft.innerHTML = `${Math.round(turn.llm_ttft_ms)} <small>ms</small>`;
     }
     if (turn.tokens_per_sec != null) {
-      el.metricTps.textContent = `${Math.round(turn.tokens_per_sec)} tok/s`;
+      el.metricTps.textContent = `${turn.tokens_per_sec}`;
     }
     if (turn.tts_ttfb_ms != null) {
       el.metricTtsTtfb.innerHTML = `${Math.round(turn.tts_ttfb_ms)} <small>ms</small>`;
@@ -227,12 +264,15 @@
 
     const parts = [];
     if (turn.eou_ms != null) parts.push(`EOU ${Math.round(turn.eou_ms)}ms`);
-    if (turn.llm_ttft_ms != null) parts.push(`LLM ${Math.round(turn.llm_ttft_ms)}ms`);
+    if (turn.llm_ttft_ms != null) parts.push(`Engine ${Math.round(turn.llm_ttft_ms)}ms`);
     if (turn.tool_total_ms > 0) parts.push(`Tool ${Math.round(turn.tool_total_ms)}ms`);
     if (turn.tts_ttfb_ms != null) parts.push(`TTS ${Math.round(turn.tts_ttfb_ms)}ms`);
 
     const isSim = modeLabel.toLowerCase().includes("sim");
-    const badgeHtml = `<span class="latency-pill ${isSim ? "sim" : ""}">${Math.round(totalMs)} ms${
+    const confirmTag = awaitingConfirm
+      ? `<span class="latency-pill confirm">Verify Before Booking</span> `
+      : "";
+    const badgeHtml = `${confirmTag}<span class="latency-pill ${isSim ? "sim" : ""}">${Math.round(totalMs)} ms${
       parts.length ? " · " + parts.join(" · ") : ""
     }</span>`;
 
@@ -251,7 +291,7 @@
       el.waterfallList.innerHTML = `<p class="muted-note">No turns recorded yet.</p>`;
       return;
     }
-    const maxTotal = Math.max(...turnHistory.map((t) => t.totalMs), 500);
+    const maxTotal = Math.max(...turnHistory.map((t) => t.totalMs), 250);
     el.waterfallList.innerHTML = turnHistory
       .slice(-6)
       .map((t) => {
@@ -263,7 +303,7 @@
         return `
           <div class="wf-row">
             <span>Turn #${t.turn_id}</span>
-            <div class="wf-bar" title="EOU ${eou}ms | LLM ${llm}ms | Tool ${tool}ms | TTS ${tts}ms">
+            <div class="wf-bar" title="EOU ${eou}ms | Engine ${llm}ms | Tool ${tool}ms | TTS ${tts}ms">
               <div class="wf-seg sw-eou" style="width:${pct(eou)}"></div>
               <div class="wf-seg sw-llm" style="width:${pct(llm)}"></div>
               <div class="wf-seg sw-tool" style="width:${pct(tool)}"></div>
@@ -276,12 +316,254 @@
       .join("");
   }
 
+  // ---- Keyless Browser Voice Mode (Web Speech API) ----
+  function resetSilenceTimer() {
+    clearTimeout(silenceTimer);
+    if (!browserVoiceActive) return;
+    silenceTimer = setTimeout(() => {
+      if (browserVoiceActive && !(window.speechSynthesis && window.speechSynthesis.speaking)) {
+        sendBrowserVoiceTurn("", "silence");
+      }
+    }, 10000);
+  }
+
+  function interruptSpeech(reason = "Barge-in") {
+    if ("speechSynthesis" in window && window.speechSynthesis.speaking) {
+      window.speechSynthesis.cancel();
+      appendSystemNote(`⚡ ${reason}: caller interrupted agent`);
+      if (browserVoiceActive) setAgentState("listening");
+    }
+  }
+
+  function speakBrowserText(text) {
+    return new Promise((resolve) => {
+      if (!("speechSynthesis" in window)) {
+        resolve(0);
+        return;
+      }
+      window.speechSynthesis.cancel();
+      const utter = new SpeechSynthesisUtterance(text);
+      utter.rate = 1.04;
+      const t0 = performance.now();
+      let started = false;
+      utter.onstart = () => {
+        started = true;
+        setAgentState("speaking");
+        resolve(Math.round(performance.now() - t0));
+      };
+      utter.onend = () => {
+        if (browserVoiceActive) {
+          setAgentState("listening");
+          resetSilenceTimer();
+        } else {
+          setAgentState("idle");
+        }
+        if (!started) resolve(0);
+      };
+      utter.onerror = () => {
+        if (browserVoiceActive) setAgentState("listening");
+        if (!started) resolve(0);
+      };
+      window.speechSynthesis.speak(utter);
+      setTimeout(() => {
+        if (!started) resolve(Math.round(performance.now() - t0));
+      }, 600);
+    });
+  }
+
+  async function sendBrowserVoiceTurn(transcript, event = "speech") {
+    clearTimeout(silenceTimer);
+    if (event === "speech" && transcript.trim()) {
+      appendTranscript("user", transcript.trim(), true);
+    } else if (event === "silence") {
+      appendSystemNote("⏱ Silence detected (10s) — prompting caller...");
+    }
+
+    setAgentState("thinking");
+    const t0 = performance.now();
+    const resp = await fetch("/api/voice/turn", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: browserSessionId,
+        transcript,
+        event,
+        patient_name: el.patientName.value.trim(),
+      }),
+    });
+    const data = await resp.json();
+    const apiRoundTripMs = performance.now() - t0;
+
+    for (const ev of data.tool_events || []) {
+      appendToolCard(ev);
+    }
+    if (data.schedule_changed) {
+      refreshSchedule();
+    }
+
+    appendTranscript("assistant", data.reply, true);
+    const ttsStartMs = await speakBrowserText(data.reply);
+    const engineMs = Math.max(0.5, Number((apiRoundTripMs - data.tool_total_ms).toFixed(1)));
+
+    recordLatencyTurn(
+      {
+        turn_id: turnHistory.length + 1,
+        eou_ms: 0,
+        llm_ttft_ms: engineMs,
+        tokens_per_sec: "Keyless NLU",
+        tool_total_ms: data.tool_total_ms,
+        tts_ttfb_ms: ttsStartMs,
+        perceived_total_ms: Math.round(apiRoundTripMs + ttsStartMs),
+      },
+      "Keyless Browser Voice (Web Speech)",
+      data.awaiting_confirmation
+    );
+  }
+
+  async function startMicVisualizer() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return;
+      audioCtx = new Ctx();
+      const source = audioCtx.createMediaStreamSource(micStream);
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 32;
+      source.connect(analyser);
+      const buf = new Uint8Array(analyser.frequencyBinCount);
+      const bars = el.waveform.querySelectorAll("span");
+      const loop = () => {
+        if (!browserVoiceActive) return;
+        analyser.getByteFrequencyData(buf);
+        bars.forEach((bar, idx) => {
+          const val = buf[idx % buf.length] || 0;
+          bar.style.height = `${Math.max(5, Math.min(22, Math.round(val / 10)))}px`;
+        });
+        vadRafId = requestAnimationFrame(loop);
+      };
+      loop();
+    } catch {
+      // Mic visualizer optional if blocked
+    }
+  }
+
+  function stopMicVisualizer() {
+    if (vadRafId) cancelAnimationFrame(vadRafId);
+    vadRafId = null;
+    if (audioCtx) {
+      audioCtx.close().catch(() => {});
+      audioCtx = null;
+    }
+    if (micStream) {
+      micStream.getTracks().forEach((t) => t.stop());
+      micStream = null;
+    }
+    el.waveform.querySelectorAll("span").forEach((b) => (b.style.height = ""));
+  }
+
+  async function toggleBrowserVoice() {
+    if (browserVoiceActive) {
+      browserVoiceActive = false;
+      clearTimeout(silenceTimer);
+      if (recognition) {
+        try {
+          recognition.stop();
+        } catch {}
+        recognition = null;
+      }
+      if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+      stopMicVisualizer();
+      el.btnBrowserVoice.classList.remove("active-voice");
+      el.btnBrowserVoice.innerHTML = `<span class="dot"></span> Talk Now (Keyless Browser Voice)`;
+      el.btnMute.disabled = true;
+      setAgentState("idle");
+      return;
+    }
+
+    if (!SpeechRecognitionCtor) {
+      appendTranscript(
+        "assistant",
+        "Web SpeechRecognition is not supported in this browser (use Chrome or Edge for mic input, or type into the turn box below to test the keyless agent).",
+        true
+      );
+      return;
+    }
+
+    browserVoiceActive = true;
+    browserMute = false;
+    el.btnBrowserVoice.classList.add("active-voice");
+    el.btnBrowserVoice.innerHTML = `<span class="dot"></span> Stop Browser Voice`;
+    el.btnMute.disabled = false;
+    el.btnMute.textContent = "Mute Mic";
+
+    await startMicVisualizer();
+
+    recognition = new SpeechRecognitionCtor();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = "en-US";
+
+    recognition.onspeechstart = () => {
+      if (!browserMute) {
+        interruptSpeech("Barge-in");
+      }
+    };
+
+    recognition.onresult = (event) => {
+      if (browserMute) return;
+      let interim = "";
+      let finalText = "";
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const res = event.results[i];
+        if (res.isFinal) {
+          finalText += res[0].transcript;
+        } else {
+          interim += res[0].transcript;
+        }
+      }
+      if (interim.trim()) {
+        interruptSpeech("Barge-in");
+        appendTranscript("user", interim.trim(), false);
+      }
+      if (finalText.trim()) {
+        sendBrowserVoiceTurn(finalText.trim(), "speech");
+      }
+    };
+
+    recognition.onerror = (ev) => {
+      if (ev.error === "no-speech" && browserVoiceActive) {
+        sendBrowserVoiceTurn("", "silence");
+      }
+    };
+
+    recognition.onend = () => {
+      if (browserVoiceActive && !browserMute) {
+        try {
+          recognition.start();
+        } catch {}
+      }
+    };
+
+    try {
+      recognition.start();
+      const greeting = "Hi, I'm Maya from PulseCare Clinic. Ask me for open slots, or say a booking ID.";
+      appendTranscript("assistant", greeting, true);
+      await speakBrowserText(greeting);
+      setAgentState("listening");
+      resetSilenceTimer();
+    } catch (err) {
+      appendSystemNote(`Microphone start failed: ${err.message}`);
+    }
+  }
+
+  // ---- LiveKit + Groq WebRTC Voice Mode ----
   async function connectLiveKit() {
     if (room) {
       await room.disconnect();
       room = null;
       el.btnConnect.classList.remove("connected");
-      el.btnConnect.innerHTML = `<span class="dot"></span> Connect Live Voice`;
+      el.btnConnect.innerHTML = `<span class="dot"></span> Connect LiveKit Voice`;
       el.btnMute.disabled = true;
       setAgentState("idle");
       return;
@@ -299,7 +581,7 @@
     if (!tokenData.configured) {
       appendTranscript(
         "assistant",
-        "LiveKit credentials are not configured in .env yet. Add LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET, GROQ_API_KEY, and CARTESIA_API_KEY (or DEEPGRAM_API_KEY), or click 'Simulate Live Call' to test the real FastAPI tool pipeline.",
+        "LiveKit credentials are not configured in .env yet. Click 'Talk Now (Keyless Browser Voice)' to speak immediately with zero API keys, or add LIVEKIT_*, GROQ_API_KEY, and CARTESIA_API_KEY to .env.",
         true
       );
       return;
@@ -321,13 +603,15 @@
         const msg = JSON.parse(new TextDecoder().decode(payload));
         if (msg.type === "agent_state") {
           setAgentState(msg.new_state);
+        } else if (msg.type === "barge_in") {
+          appendSystemNote("⚡ Barge-in detected: caller interrupted agent");
         } else if (msg.type === "transcript") {
           appendTranscript(msg.role, msg.text, msg.is_final);
         } else if (msg.type === "tool_call") {
           appendToolCard(msg);
           refreshSchedule();
         } else if (msg.type === "latency_turn") {
-          recordLatencyTurn(msg, "Live WebRTC");
+          recordLatencyTurn(msg, "LiveKit + Groq WebRTC");
         }
       } catch (err) {
         console.error("Failed to parse telemetry:", err);
@@ -337,7 +621,7 @@
     room.on(LiveKit.RoomEvent.Disconnected, () => {
       room = null;
       el.btnConnect.classList.remove("connected");
-      el.btnConnect.innerHTML = `<span class="dot"></span> Connect Live Voice`;
+      el.btnConnect.innerHTML = `<span class="dot"></span> Connect LiveKit Voice`;
       el.btnMute.disabled = true;
       setAgentState("idle");
     });
@@ -353,6 +637,16 @@
   }
 
   async function toggleMute() {
+    if (browserVoiceActive) {
+      browserMute = !browserMute;
+      el.btnMute.textContent = browserMute ? "Unmute Mic" : "Mute Mic";
+      if (browserMute && recognition) {
+        try { recognition.stop(); } catch {}
+      } else if (!browserMute && recognition) {
+        try { recognition.start(); } catch {}
+      }
+      return;
+    }
     if (!room) return;
     isMuted = !isMuted;
     await room.localParticipant.setMicrophoneEnabled(!isMuted);
@@ -367,10 +661,9 @@
     const phone = "555-0184";
 
     try {
-      // Turn 1: Check dental slots tomorrow via REAL FastAPI GET /api/slots
       setAgentState("listening");
       appendTranscript("user", "Hi, do you have any dental appointments available tomorrow?", true);
-      await sleep(350);
+      await sleep(300);
       setAgentState("thinking");
 
       const t1 = performance.now();
@@ -389,32 +682,49 @@
 
       setAgentState("speaking");
       const reply1 = chosenSlot
-        ? `Hi ${patient}! Dr. Elena Rostova has an opening tomorrow at ${chosenSlot.start_time} in slot ${chosenSlot.id}. Would you like me to book that for you?`
-        : "I checked Dentistry for tomorrow, and those slots are currently full. Would you like another day?";
+        ? `Hi ${patient}! Dr. Elena Rostova has an opening tomorrow at ${chosenSlot.start_time} in slot ${chosenSlot.id}. Would you like that time?`
+        : "I checked Dentistry for tomorrow, and those slots are currently full.";
       appendTranscript("assistant", reply1, true);
       recordLatencyTurn(
         {
           turn_id: turnHistory.length + 1,
           eou_ms: 95,
           llm_ttft_ms: 128,
-          tokens_per_sec: 265,
+          tokens_per_sec: "265 tok/s",
           tool_total_ms: tool1Ms,
           tts_ttfb_ms: 108,
           perceived_total_ms: 331 + tool1Ms,
         },
-        "Simulated Voice + Real FastAPI"
+        "Keyless Fallback Simulation"
       );
-      await sleep(900);
+      await sleep(750);
 
       if (chosenSlot) {
-        // Turn 2: Book the slot via REAL FastAPI POST /api/appointments
-        setAgentState("listening");
+        // Verify before booking read-back turn
+        appendTranscript("user", `Yes, hold ${chosenSlot.id} for ${patient}, phone ${phone}.`, true);
+        await sleep(300);
         appendTranscript(
-          "user",
-          `Yes please, book it under ${patient}, phone ${phone}, for a dental checkup.`,
+          "assistant",
+          `Let me verify before booking: Dentistry with ${chosenSlot.doctor_name} on ${chosenSlot.date} at ${chosenSlot.start_time} for ${patient}, phone 5 5 5, 0 1 8 4. Shall I confirm?`,
           true
         );
-        await sleep(350);
+        recordLatencyTurn(
+          {
+            turn_id: turnHistory.length + 1,
+            eou_ms: 86,
+            llm_ttft_ms: 115,
+            tokens_per_sec: "278 tok/s",
+            tool_total_ms: 0,
+            tts_ttfb_ms: 101,
+            perceived_total_ms: 302,
+          },
+          "Keyless Fallback Simulation",
+          true
+        );
+        await sleep(750);
+
+        appendTranscript("user", "Yes, confirm it.", true);
+        await sleep(300);
         setAgentState("thinking");
 
         const t2 = performance.now();
@@ -433,7 +743,7 @@
 
         appendToolCard({
           name: "book_appointment",
-          args: { slot_id: chosenSlot.id, patient_name: patient, phone, reason: "Dental checkup" },
+          args: { slot_id: chosenSlot.id, patient_name: patient, phone, confirmed: true },
           duration_ms: tool2Ms,
           success: bookResp.ok,
           result: booked,
@@ -442,7 +752,7 @@
         setAgentState("speaking");
         appendTranscript(
           "assistant",
-          `You are all set! Your booking ID is ${booked.booking_id} with ${booked.doctor_name} on ${booked.date} at ${booked.start_time}.`,
+          `Confirmed! Booking ${booked.booking_id} is booked with ${booked.doctor_name} on ${booked.date} at ${booked.start_time}.`,
           true
         );
         recordLatencyTurn(
@@ -450,57 +760,16 @@
             turn_id: turnHistory.length + 1,
             eou_ms: 88,
             llm_ttft_ms: 119,
-            tokens_per_sec: 282,
+            tokens_per_sec: "282 tok/s",
             tool_total_ms: tool2Ms,
             tts_ttfb_ms: 102,
             perceived_total_ms: 309 + tool2Ms,
           },
-          "Simulated Voice + Real FastAPI"
-        );
-        await sleep(900);
-
-        // Turn 3: Lookup confirmation via REAL FastAPI GET /api/appointments/lookup
-        setAgentState("listening");
-        appendTranscript("user", `Can you confirm booking ${booked.booking_id}?`, true);
-        await sleep(300);
-        setAgentState("thinking");
-
-        const t3 = performance.now();
-        const lookupResp = await fetch(
-          `/api/appointments/lookup?booking_id=${encodeURIComponent(booked.booking_id)}`
-        );
-        const found = await lookupResp.json();
-        const tool3Ms = Number((performance.now() - t3).toFixed(1));
-
-        appendToolCard({
-          name: "lookup_appointment",
-          args: { booking_id: booked.booking_id },
-          duration_ms: tool3Ms,
-          success: lookupResp.ok,
-          result: found,
-        });
-
-        setAgentState("speaking");
-        appendTranscript(
-          "assistant",
-          `Confirmed! Booking ${booked.booking_id} for ${patient} is active with ${booked.doctor_name} at ${booked.start_time}.`,
-          true
-        );
-        recordLatencyTurn(
-          {
-            turn_id: turnHistory.length + 1,
-            eou_ms: 82,
-            llm_ttft_ms: 112,
-            tokens_per_sec: 290,
-            tool_total_ms: tool3Ms,
-            tts_ttfb_ms: 99,
-            perceived_total_ms: 293 + tool3Ms,
-          },
-          "Simulated Voice + Real FastAPI"
+          "Keyless Fallback Simulation"
         );
       }
     } finally {
-      await sleep(400);
+      await sleep(350);
       setAgentState("idle");
       el.btnDemo.disabled = false;
       refreshSchedule();
@@ -521,9 +790,20 @@
     };
   }
 
+  el.btnBrowserVoice.addEventListener("click", toggleBrowserVoice);
   el.btnConnect.addEventListener("click", connectLiveKit);
+  el.btnBargeIn.addEventListener("click", () => interruptSpeech("Manual barge-in"));
   el.btnMute.addEventListener("click", toggleMute);
   el.btnDemo.addEventListener("click", runSimulatedLiveCall);
+  el.voiceTextForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const text = el.voiceTextInput.value.trim();
+    if (!text) return;
+    el.voiceTextInput.value = "";
+    interruptSpeech("Barge-in");
+    await sendBrowserVoiceTurn(text, "speech");
+    if (!browserVoiceActive) setAgentState("idle");
+  });
   el.btnReset.addEventListener("click", async () => {
     latestBookingId = null;
     await fetch("/api/reset", { method: "POST" });
@@ -538,6 +818,7 @@
   });
   el.specialtyFilter.addEventListener("change", refreshSchedule);
 
+  initWebSpeechPill();
   refreshHealth();
   refreshSchedule();
   connectSse();

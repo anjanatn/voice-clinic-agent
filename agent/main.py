@@ -48,10 +48,15 @@ def _build_instructions() -> str:
         "Never use markdown, bullet lists, or asterisks in your replies because your text is spoken aloud. "
         "Our specialties are General Medicine (Dr. Maya Patel), Dentistry (Dr. Elena Rostova), "
         "Dermatology (Dr. Marcus Chen), and Pediatrics (Dr. Priya Nair). "
-        "Always check real availability with check_available_slots before promising any time. "
-        "Before calling book_appointment, confirm you have the patient's full name, phone number, "
-        "reason for visit, and chosen slot ID. "
-        "When an appointment is booked or looked up, clearly read out the booking ID (e.g. BK-1044), doctor, date, and time."
+        "VOICE EDGE CASES: "
+        "1) Always confirm names, phone numbers (read digits clearly), and exact dates/times back to the caller, "
+        "since speech-to-text can mishear them. "
+        "2) Before writing any booking or cancellation to the database, read back the slot details, doctor, date, time, "
+        "patient name, and phone number and explicitly ask 'Shall I confirm?'. Call book_appointment with confirmed=False "
+        "first if you need a structured read-back check, and ONLY pass confirmed=True after the caller explicitly agrees. "
+        "3) If the caller says 'sorry, can you repeat that' or 'what did you say', call repeat_last_reply or repeat your "
+        "previous message clearly without changing state. "
+        "4) Always check real availability with check_available_slots before promising any time."
     )
 
 
@@ -59,6 +64,7 @@ class ClinicReceptionistAgent(Agent):
     def __init__(self, api_client: ClinicAPIClient) -> None:
         super().__init__(instructions=_build_instructions())
         self.api_client = api_client
+        self.last_assistant_reply: str = ""
 
     @function_tool
     async def check_available_slots(
@@ -90,15 +96,36 @@ class ClinicReceptionistAgent(Agent):
         patient_name: str,
         phone: str,
         reason: str = "General consultation",
+        confirmed: bool = False,
     ) -> str:
-        """Book an available clinic slot for a patient.
+        """Book an available clinic slot for a patient. Always verify with confirmed=False before setting confirmed=True.
 
         Args:
             slot_id: The slot ID returned by check_available_slots, e.g. SLOT-007.
             patient_name: Patient full name.
             phone: Patient phone number.
             reason: Short reason for the visit.
+            confirmed: Must remain False until the agent has read back the slot, name, phone, and date and the caller confirmed.
         """
+        if not confirmed:
+            slots_res = await self.api_client.check_available_slots()
+            matched = [s for s in slots_res.get("slots", []) if s["id"].upper() == slot_id.strip().upper()]
+            slot_info = matched[0] if matched else {"id": slot_id}
+            return json.dumps(
+                {
+                    "status": "awaiting_confirmation",
+                    "database_written": False,
+                    "slot": slot_info,
+                    "patient_name": patient_name,
+                    "phone": phone,
+                    "reason": reason,
+                    "instruction": (
+                        "Read back the slot, doctor, date, time, patient name, and phone digits to the caller "
+                        "and ask 'Shall I confirm?' before calling book_appointment with confirmed=True."
+                    ),
+                }
+            )
+
         result = await self.api_client.book_appointment(
             slot_id=slot_id,
             patient_name=patient_name,
@@ -135,13 +162,25 @@ class ClinicReceptionistAgent(Agent):
         context: RunContext,
         booking_id: str,
         new_slot_id: str,
+        confirmed: bool = False,
     ) -> str:
-        """Move an existing appointment to a new open slot.
+        """Move an existing appointment to a new open slot after caller confirmation.
 
         Args:
             booking_id: Existing booking reference such as BK-1042.
             new_slot_id: New slot ID from check_available_slots.
+            confirmed: Must remain False until the caller confirms the new date and time.
         """
+        if not confirmed:
+            return json.dumps(
+                {
+                    "status": "awaiting_confirmation",
+                    "database_written": False,
+                    "booking_id": booking_id,
+                    "new_slot_id": new_slot_id,
+                    "instruction": "Read back the new date/time and ask 'Shall I confirm?' before calling with confirmed=True.",
+                }
+            )
         result = await self.api_client.reschedule_appointment(
             booking_id=booking_id,
             new_slot_id=new_slot_id,
@@ -153,14 +192,30 @@ class ClinicReceptionistAgent(Agent):
         self,
         context: RunContext,
         booking_id: str,
+        confirmed: bool = False,
     ) -> str:
-        """Cancel an existing appointment by booking ID and free the time slot.
+        """Cancel an existing appointment by booking ID after caller confirmation.
 
         Args:
             booking_id: Booking reference to cancel, e.g. BK-1042.
+            confirmed: Must remain False until the caller confirms cancelling.
         """
+        if not confirmed:
+            return json.dumps(
+                {
+                    "status": "awaiting_confirmation",
+                    "database_written": False,
+                    "booking_id": booking_id,
+                    "instruction": "Read back the booking ID and ask 'Shall I confirm cancelling?' before calling with confirmed=True.",
+                }
+            )
         result = await self.api_client.cancel_appointment(booking_id=booking_id)
         return json.dumps(result)
+
+    @function_tool
+    async def repeat_last_reply(self, context: RunContext) -> str:
+        """Return the assistant's previous spoken message when the caller asks to repeat."""
+        return self.last_assistant_reply or "I asked how I can help with your clinic appointment today."
 
 
 def _create_tts():
@@ -201,12 +256,21 @@ async def entrypoint(ctx: JobContext) -> None:
         await publish_telemetry(event)
 
     api_client = ClinicAPIClient(on_tool_event=on_tool_event)
+    agent = ClinicReceptionistAgent(api_client=api_client)
 
     session = AgentSession(
         stt=groq.STT(model=os.getenv("GROQ_STT_MODEL", "whisper-large-v3-turbo")),
         llm=groq.LLM(model=os.getenv("GROQ_LLM_MODEL", "llama-3.3-70b-versatile")),
         tts=_create_tts(),
         vad=silero.VAD.load(),
+        allow_interruptions=True,
+        min_interruption_duration=0.4,
+        min_interruption_words=1,
+        false_interruption_timeout=2.0,
+        resume_false_interruption=True,
+        min_endpointing_delay=0.35,
+        max_endpointing_delay=3.0,
+        user_away_timeout=12.0,
     )
 
     usage_collector = metrics.UsageCollector()
@@ -224,9 +288,19 @@ async def entrypoint(ctx: JobContext) -> None:
             )
         )
 
+    @session.on("user_state_changed")
+    def _on_user_state(ev: Any) -> None:
+        if str(getattr(ev, "new_state", "")) == "away":
+            asyncio.create_task(
+                session.say("Sorry, I didn't hear anything—are you still there? Let me know if you'd like me to repeat that.")
+            )
+
     @session.on("agent_state_changed")
     def _on_agent_state(ev: AgentStateChangedEvent) -> None:
+        old_state = str(ev.old_state)
         new_state = str(ev.new_state)
+        if old_state == "speaking" and new_state == "listening":
+            asyncio.create_task(publish_telemetry({"type": "barge_in"}))
         if new_state == "thinking":
             tracker.mark_thinking_started()
         elif new_state == "speaking":
@@ -240,7 +314,7 @@ async def entrypoint(ctx: JobContext) -> None:
             publish_telemetry(
                 {
                     "type": "agent_state",
-                    "old_state": str(ev.old_state),
+                    "old_state": old_state,
                     "new_state": new_state,
                 }
             )
@@ -254,6 +328,7 @@ async def entrypoint(ctx: JobContext) -> None:
         if callable(text):
             text = text()
         if role == "assistant" and text:
+            agent.last_assistant_reply = text
             asyncio.create_task(
                 publish_telemetry(
                     {
@@ -294,7 +369,6 @@ async def entrypoint(ctx: JobContext) -> None:
 
     ctx.add_shutdown_callback(_shutdown)
 
-    agent = ClinicReceptionistAgent(api_client=api_client)
     await session.start(room=ctx.room, agent=agent)
 
     await session.generate_reply(
